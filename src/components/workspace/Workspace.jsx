@@ -6,9 +6,10 @@ import Editor from '@monaco-editor/react'
 import { apiRequest, getApiBaseUrl, getErrorMessage } from '../../lib/api'
 
 const API_BASE_URL = getApiBaseUrl()
-const TREE_TIMEOUT_MS = 10000
-const SEARCH_TIMEOUT_MS = 60000
-const UPLOAD_TIMEOUT_MS = 120000
+const TREE_TIMEOUT_MS = 70000
+const SEARCH_TIMEOUT_MS = 90000
+const UPLOAD_TIMEOUT_MS = 180000
+const BACKEND_WAIT_DELAY_MS = 1500
 const GROQ_KEY_STORAGE_KEY = 'repomind.groq_api_key'
 
 const loadStoredGroqApiKey = () => {
@@ -90,7 +91,7 @@ const SearchResultCard = ({ result, onClick, isActive }) => {
   )
 }
 
-const StatusBanner = ({ tone = 'neutral', title, message, detail, actionLabel, onAction }) => {
+const StatusBanner = ({ tone = 'neutral', title, message, detail, actionLabel, onAction, loading = false }) => {
   const toneStyles = {
     neutral: 'bg-zinc-900/60 border-zinc-800 text-zinc-300',
     info: 'bg-sky-500/10 border-sky-500/20 text-sky-100',
@@ -103,7 +104,7 @@ const StatusBanner = ({ tone = 'neutral', title, message, detail, actionLabel, o
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2 mb-1">
-            <AlertCircle size={14} />
+            {loading ? <RefreshCw size={14} className="animate-spin" /> : <AlertCircle size={14} />}
             <span className="text-[10px] font-bold uppercase tracking-wider">{title}</span>
           </div>
           <p className="text-[11px] leading-relaxed">{message}</p>
@@ -137,11 +138,15 @@ export const Workspace = ({ onBack }) => {
   const [apiError, setApiError] = useState('')
   const [backendIndexStatus, setBackendIndexStatus] = useState('idle')
   const [isBootstrapping, setIsBootstrapping] = useState(true)
+  const [isWaitingOnBackend, setIsWaitingOnBackend] = useState(false)
+  const [backendWaitMessage, setBackendWaitMessage] = useState('')
   const fileInputRef = useRef(null)
   const editorRef = useRef(null)
   const monacoRef = useRef(null)
   const decorationIdsRef = useRef([])
   const hasInitializedRef = useRef(false)
+  const activeBackendRequestsRef = useRef(0)
+  const backendWaitTimerRef = useRef(null)
   const normalizedSearchMessage = searchMessage.toLowerCase()
 
   useEffect(() => {
@@ -155,12 +160,49 @@ export const Workspace = ({ onBack }) => {
     }
   }, [groqApiKey])
 
-  const loadFileContent = async (path) => {
-    return apiRequest('/file-content', {
-      searchParams: { path },
-      timeoutMs: TREE_TIMEOUT_MS,
-    })
-  }
+  const withBackendLoader = useCallback(async (request, waitMessage) => {
+    activeBackendRequestsRef.current += 1
+    setBackendWaitMessage(waitMessage)
+
+    if (activeBackendRequestsRef.current === 1) {
+      backendWaitTimerRef.current = window.setTimeout(() => {
+        setIsWaitingOnBackend(true)
+      }, BACKEND_WAIT_DELAY_MS)
+    }
+
+    try {
+      return await request()
+    } finally {
+      activeBackendRequestsRef.current = Math.max(0, activeBackendRequestsRef.current - 1)
+
+      if (activeBackendRequestsRef.current === 0) {
+        if (backendWaitTimerRef.current) {
+          window.clearTimeout(backendWaitTimerRef.current)
+          backendWaitTimerRef.current = null
+        }
+        setIsWaitingOnBackend(false)
+        setBackendWaitMessage('')
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (backendWaitTimerRef.current) {
+        window.clearTimeout(backendWaitTimerRef.current)
+      }
+    }
+  }, [])
+
+  const loadFileContent = useCallback(async (path) => {
+    return withBackendLoader(
+      () => apiRequest('/file-content', {
+        searchParams: { path },
+        timeoutMs: TREE_TIMEOUT_MS,
+      }),
+      'Opening file preview. The backend may still be waking up on Render.',
+    )
+  }, [withBackendLoader])
 
   const fetchBackendState = useCallback(async ({ silent = false } = {}) => {
     if (!silent) {
@@ -168,8 +210,13 @@ export const Workspace = ({ onBack }) => {
     }
 
     try {
-      const health = await apiRequest('/health', { timeoutMs: TREE_TIMEOUT_MS })
-      const tree = await apiRequest('/tree', { timeoutMs: TREE_TIMEOUT_MS })
+      const [health, tree] = await withBackendLoader(
+        () => Promise.all([
+          apiRequest('/health', { timeoutMs: TREE_TIMEOUT_MS }),
+          apiRequest('/tree', { timeoutMs: TREE_TIMEOUT_MS }),
+        ]),
+        'Waking up the backend. Render free instances can take up to a minute to respond.',
+      )
 
       setRepoTree(tree)
       setApiError('')
@@ -193,7 +240,7 @@ export const Workspace = ({ onBack }) => {
         setIsBootstrapping(false)
       }
     }
-  }, [statusMessage])
+  }, [statusMessage, withBackendLoader])
 
   useEffect(() => {
     if (hasInitializedRef.current) return
@@ -287,15 +334,18 @@ export const Workspace = ({ onBack }) => {
     setApiError('')
 
     try {
-      const data = await apiRequest('/search', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          query: query.trim(),
-          groqApiKey: groqApiKey.trim() || undefined,
+      const data = await withBackendLoader(
+        () => apiRequest('/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            query: query.trim(),
+            groqApiKey: groqApiKey.trim() || undefined,
+          }),
+          timeoutMs: SEARCH_TIMEOUT_MS,
         }),
-        timeoutMs: SEARCH_TIMEOUT_MS,
-      })
+        'Waiting for the backend search service to respond. Render cold starts can take around 50 seconds.',
+      )
 
       setResults(data.results || [])
       setSearchMessage(data.message || '')
@@ -331,11 +381,14 @@ export const Workspace = ({ onBack }) => {
     formData.append('file', file)
 
     try {
-      const data = await apiRequest('/upload-repo', {
-        method: 'POST',
-        body: formData,
-        timeoutMs: UPLOAD_TIMEOUT_MS,
-      })
+      const data = await withBackendLoader(
+        () => apiRequest('/upload-repo', {
+          method: 'POST',
+          body: formData,
+          timeoutMs: UPLOAD_TIMEOUT_MS,
+        }),
+        'Uploading your project and waiting for the backend to respond. The first request may take a while on Render.',
+      )
 
       await fetchBackendState({ silent: true })
       setResults([])
@@ -355,7 +408,10 @@ export const Workspace = ({ onBack }) => {
     setApiError('')
 
     try {
-      const data = await apiRequest('/reset', { timeoutMs: SEARCH_TIMEOUT_MS })
+      const data = await withBackendLoader(
+        () => apiRequest('/reset', { timeoutMs: SEARCH_TIMEOUT_MS }),
+        'Reloading the sample repository. The backend may still be waking up.',
+      )
       await fetchBackendState({ silent: true })
       setResults([])
       setSelectedResult(null)
@@ -531,6 +587,17 @@ export const Workspace = ({ onBack }) => {
                 </div>
               </div>
             </form>
+            {isWaitingOnBackend ? (
+              <div className="mt-4">
+                <StatusBanner
+                  tone="info"
+                  title="Waking Backend"
+                  message={backendWaitMessage || 'Waiting for the backend to respond.'}
+                  detail={API_BASE_URL}
+                  loading
+                />
+              </div>
+            ) : null}
           </div>
 
           <div className="flex flex-1 flex-col xl:min-h-0 xl:flex-row">
